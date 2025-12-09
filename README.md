@@ -1,4 +1,4 @@
 # SleepyJoe
 Atmega328p for doing daily pulse and sleep
 
-<img width="2682" height="1235" alt="clkPullupWorking" src="https://github.com/user-attachments/assets/6fed4bb6-79e3-44ab-9d6c-eee658bbd5b4" />
+<img width="2669" height="1234" alt="sjSolDone" src="https://github.com/user-attachments/assets/86a664b1-67d1-4360-b65e-f23fc4ed1d72" />
