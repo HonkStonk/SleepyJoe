@@ -29,6 +29,9 @@ TM1637Display displayTriggerTime(TM_CLK_TRIG, TM_DIO_TRIG);
 #define BTN_TIME_OPEN_MINUS   A1      // A1
 #define BTN_TIME_OPEN_PLUS    A2      // A2
 
+// --- Solenoid (IRL540N low-side on D8) ---
+#define SOL_PIN 8
+
 // --- EEPROM layout for open time ---  <<< NEW
 #define EEPROM_MAGIC_ADDR      0
 #define EEPROM_OPEN_HOUR_ADDR  1
@@ -274,6 +277,64 @@ void adjustOpenTime(int deltaMinutes) {
   setupRTCAlarm();
 }
 
+// -------- Solenoid control (3-hammer pattern) --------
+
+void solenoidOn() {
+  pinMode(SOL_PIN, OUTPUT);
+  digitalWrite(SOL_PIN, HIGH);   // IRL540 gate HIGH -> solenoid ON
+}
+
+void solenoidOff() {
+  digitalWrite(SOL_PIN, LOW);    // gate LOW -> solenoid OFF
+  pinMode(SOL_PIN, INPUT);
+}
+
+// Called once when RTC alarm wakes the MCU
+void hammerSolenoid() {
+  // Ensure pin is an output and off
+  pinMode(SOL_PIN, OUTPUT);
+  solenoidOff();
+  delay(10);
+
+  // Pulse 1: 120 ms ON, 200 ms OFF
+  solenoidOn();
+  delay(120);
+  solenoidOff();
+  delay(200);
+
+  // Pulse 2: 200 ms ON, 250 ms OFF
+  solenoidOn();
+  delay(200);
+  solenoidOff();
+  delay(250);
+
+  // Pulse 3: 280 ms ON
+  solenoidOn();
+  delay(280);
+  solenoidOff();
+}
+
+void hammerSolenoidOnce() {
+  solenoidOff();
+  delay(10);
+  solenoidOn();
+  delay(120); // works 100% with 3xAA + 3xAA in series
+  solenoidOff();
+}
+
+void hammerSolenoidBuzz() {
+  const uint8_t  PULSE_COUNT = 50;  // try 40 first
+  const uint16_t ON_MS       = 17;  // 17 ms on
+  const uint16_t OFF_MS      = 11;  // 1 ms off
+
+  for (uint8_t i = 0; i < PULSE_COUNT; i++) {
+    solenoidOn();
+    delay(ON_MS);
+    solenoidOff();
+    delay(OFF_MS);
+  }
+}
+
 // -------- Blink to signal rtc alarm trigger worked ------
 void blinkRtcTrigger() {
   for (uint8_t i = 0; i < 5; i++) {
@@ -315,6 +376,9 @@ void preparePinsForSleep() {
 
   // D4 wake input: input, no pullup; R1 handles pull-down
   pinMode(BUTTON_PIN, INPUT);
+
+  pinMode(SOL_PIN, INPUT);
+  digitalWrite(SOL_PIN, LOW);
 }
 
 // -------------------- Setup --------------------
@@ -343,6 +407,10 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
+  // Solenoid gate
+  pinMode(SOL_PIN, OUTPUT);
+  solenoidOff();
+
   wdt_disable();
 
   initDisplays();
@@ -366,6 +434,7 @@ void loop() {
 
     // If we woke due to RTC alarm, clear it now
     if (rtcWake) {
+      hammerSolenoidOnce();          // hammertime
       blinkRtcTrigger();
       rtc.clearAlarm(2);
       configureRTCForVBATAlarm();  // re-enable A2IE / clear flags  <<< NEW safety
