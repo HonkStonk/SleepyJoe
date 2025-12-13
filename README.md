@@ -1,5 +1,4 @@
 # SleepyJoe
 Atmega328p for doing daily pulse and sleep
 
-<img width="2676" height="1227" alt="dualBatFixed" src="https://github.com/user-attachments/assets/43b78408-8aa2-4ed2-96a6-bc5ad4810c23" />
-
+<img width="2689" height="1249" alt="completestPullups" src="https://github.com/user-attachments/assets/57517699-8f69-4ce3-9987-ec29fb40f9da" />
