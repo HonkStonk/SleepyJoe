@@ -7,6 +7,17 @@
 #include <EEPROM.h>          
 #include "RTClib.h"
 
+// -------------------- Button helpers (must be near top to avoid Arduino auto-prototype issues) --------------------
+
+struct RepeatBtn {
+  bool     prevPressed = false;
+  uint32_t pressedAtMs = 0;
+  uint32_t lastFireMs  = 0;
+};
+
+static int stepFromHoldMs(uint32_t heldMs);
+static int updateRepeatButton(RepeatBtn &b, bool pressed, uint32_t nowMs);
+
 RTC_DS3231 rtc;
 
 // --- Displays ---
@@ -29,6 +40,7 @@ TM1637Display displayTriggerTime(TM_CLK, TM_DIO_TRIG);
 
 // --- Solenoid (IRL540N low-side on D8) ---
 #define SOL_PIN 9
+#define MARIO_DUTY_PERMILLE  310   // 31.0% works good when health percent = 86% - and basePercentIdle = 99% - later auto compensate this
 
 // --- Powers DS3231 VCC+I2C pullups ---
 #define RTC_POWER_PIN 5
@@ -175,7 +187,7 @@ uint8_t computeBatteryHealthPercent(uint16_t vIdle_mV, uint16_t vSag_mV)
   uint8_t base      = basePercentFromIdle(vIdle_mV);        // 0..100
   uint8_t sagHealth = sagHealthPercent(vIdle_mV, vSag_mV);  // 0..100
 
-  // Weight: 70% idle voltage, 30% sag behavior (tune later)
+  // Weight: 70% idle voltage, 30% sag behavior (tune later) - also does measured temperature help here?
   uint16_t h = (uint16_t)base * 70 + (uint16_t)sagHealth * 30;
   h /= 100;
   if (h > 100) h = 100;
@@ -206,6 +218,58 @@ void showTime(TM1637Display &disp, int hours, int minutes) {
 void showTriggerTime(TM1637Display &disp, int hours, int minutes) {
   int trigTime = hours * 100 + minutes;
   disp.showNumberDecEx(trigTime, 0b01000000, true);
+}
+
+// -------------------- Button helpers --------------------
+
+static int stepFromHoldMs(uint32_t heldMs) {
+  if (heldMs >= 2500) return 30;  // long hold
+  if (heldMs >= 1200) return 10;  // medium hold
+  return 1;                       // short hold
+}
+
+// returns 0 if no action, otherwise returns +step or -step (you decide sign outside)
+static int updateRepeatButton(RepeatBtn &b, bool pressed, uint32_t nowMs) {
+  // tuning knobs
+  const uint16_t HOLD_START_MS   = 350; // start repeating after this (tap still works)
+  const uint16_t REPEAT_1_MS     = 220; // repeat interval while step=1
+  const uint16_t REPEAT_10_MS    = 180; // repeat interval while step=10
+  const uint16_t REPEAT_30_MS    = 150; // repeat interval while step=30
+
+  // Rising edge => one immediate 1-minute step
+  if (pressed && !b.prevPressed) {
+    b.pressedAtMs = nowMs;
+    b.lastFireMs  = nowMs;
+    b.prevPressed = true;
+    return 1;
+  }
+
+  // Released
+  if (!pressed && b.prevPressed) {
+    b.prevPressed = false;
+    return 0;
+  }
+
+  // Held
+  if (pressed) {
+    uint32_t heldMs = nowMs - b.pressedAtMs;
+    if (heldMs < HOLD_START_MS) {
+      return 0;
+    }
+
+    int step = stepFromHoldMs(heldMs);
+    uint16_t interval =
+      (step == 1)  ? REPEAT_1_MS :
+      (step == 10) ? REPEAT_10_MS :
+                     REPEAT_30_MS;
+
+    if ((uint32_t)(nowMs - b.lastFireMs) >= interval) {
+      b.lastFireMs = nowMs;
+      return step;
+    }
+  }
+
+  return 0;
 }
 
 // -------------------- EEPROM helpers (open time) ---------
@@ -448,152 +512,182 @@ void fireSolenoidWithSagMeasure(uint16_t &vIdle, uint16_t &vSag) {
 }
 
 // -------------------- Mario melody on SOL_PIN (D9 / OC1A / Timer1) --------------------
+// Interrupt-driven scheduler via Timer2 (1ms tick). Timer0 (millis) is untouched.
 // D9 on ATmega328P = PB1 = OC1A
 
-static void timer1StartToggleOC1A(uint16_t freqHz) {
-  // CTC mode (TOP = OCR1A), toggle OC1A on compare match
-  // f_out = F_CPU / (2 * prescaler * (1 + OCR1A))
-  const uint16_t presc = 64;
+// ---------- [1] PWM generation on Timer1 (same as you had) ----------
+static void timer1StartPwmOC1A(uint16_t freqHz, uint16_t dutyPermille) {
+  if (freqHz < 1) freqHz = 1;
+  if (dutyPermille > 900) dutyPermille = 900;
 
-  uint32_t ocr = (F_CPU / (2UL * presc * (uint32_t)freqHz)) - 1UL;
-  if (ocr > 65535UL) ocr = 65535UL;
-  if (ocr < 1UL)     ocr = 1UL;
+  const uint16_t presc = 8;
 
-  // Ensure OC1A pin is output (PB1)
-  DDRB |= _BV(DDB1);
+  uint32_t top = (F_CPU / (uint32_t)presc / (uint32_t)freqHz) - 1UL;
+  if (top > 65535UL) top = 65535UL;
+  if (top < 10UL)    top = 10UL;
 
-  // Stop timer
+  DDRB |= _BV(DDB1);      // PB1 / D9 output
+
   TCCR1A = 0;
   TCCR1B = 0;
   TCNT1  = 0;
 
-  OCR1A = (uint16_t)ocr;
+  ICR1 = (uint16_t)top;
 
-  // Toggle OC1A on compare match
-  TCCR1A = _BV(COM1A0);
+  uint32_t ticks = (uint32_t)(top + 1UL) * (uint32_t)dutyPermille / 1000UL;
+  if (ticks < 1UL) ticks = 1UL;
+  if (ticks > top) ticks = top;
+  OCR1A = (uint16_t)ticks;
 
-  // CTC mode (WGM12=1), prescaler = 64 (CS11|CS10)
-  TCCR1B = _BV(WGM12) | _BV(CS11) | _BV(CS10);
+  TCCR1A = _BV(COM1A1) | _BV(WGM11);
+  TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS11); // prescaler 8
 }
 
 static void timer1StopOC1A() {
-  // Stop timer and disconnect OC1A toggling
   TCCR1A = 0;
   TCCR1B = 0;
+  PORTB &= ~_BV(PORTB1);  // force D9 low (still output)
 }
 
-// Plays one "note" using Timer1 toggle
-static void playNoteTimer1_OC1A(uint16_t freqHz, uint16_t onMs, uint16_t offMs) {
-  if (freqHz == 0) {
-    // rest
-    timer1StopOC1A();
-    delay(onMs + offMs);
-    return;
-  }
-
-  timer1StartToggleOC1A(freqHz);
-  delay(onMs);
-  timer1StopOC1A();
-  PORTB &= ~_BV(PORTB1); // drive D9 low (only if it’s still output)
-
-  // Make sure the gate isn't left "half-driven" by peripheral
-  // (after stopping timer, OC1A is disconnected; keep pin low if it was output)
-  // We'll restore DDR/PORT later anyway.
-  delay(offMs);
-}
-
-// Public function: plays 7 notes and restores everything exactly as it was
-void playMario7OnSolenoidPin9() {
-  // Make sure we don't accidentally do a long DC pull before buzzing
-  solenoidOff();
-  delay(10);
-
-  // ---- Save Timer1 + PB1 (D9) pin state ----
-  uint8_t  savedTCCR1A = TCCR1A;
-  uint8_t  savedTCCR1B = TCCR1B;
-  uint16_t savedOCR1A  = OCR1A;
-  uint16_t savedTCNT1  = TCNT1;
-  uint8_t  savedTIMSK1 = TIMSK1;
-
-  uint8_t savedDDRB  = DDRB;
-  uint8_t savedPORTB = PORTB;
-
-  // Disable Timer1 interrupts (you aren't using them, but be clean)
-  TIMSK1 = 0;
-
-  // ---- "Mario intro" 7 notes (recognizable) ----
-  // Frequencies (approx):
-  // E5=659, C5=523, G5=784, G4=392
-  // Pattern: E5, E5, E5, C5, E5, G5, G4  (with small gaps)
-  playNoteTimer1_OC1A(659, 120, 80);   // E5
-  playNoteTimer1_OC1A(659, 120, 160);  // E5
-  playNoteTimer1_OC1A(659, 120, 160);  // E5
-  playNoteTimer1_OC1A(523, 120, 80);   // C5
-  playNoteTimer1_OC1A(659, 120, 220);  // E5
-  playNoteTimer1_OC1A(784, 160, 260);  // G5
-  playNoteTimer1_OC1A(392, 160, 0);    // G4
-
-  // ---- Restore Timer1 + PB1 state ----
-  TCCR1A = savedTCCR1A;
-  OCR1A  = savedOCR1A;
-  TCNT1  = savedTCNT1;
-  TCCR1B = savedTCCR1B;
-  TIMSK1 = savedTIMSK1;
-
-  DDRB  = (DDRB  & ~_BV(DDB1))  | (savedDDRB  & _BV(DDB1));
-  PORTB = (PORTB & ~_BV(PORTB1))| (savedPORTB & _BV(PORTB1));
-
-  // Safety: leave solenoid off
-  solenoidOff();
-}
-
-//--------- a little better music magic ------------
+// ---------- [2] Melody data ----------
 struct MarioNote { uint16_t freq; uint16_t durMs; uint16_t gapMs; };
 
 static const MarioNote mario7[] = {
-  {659, 120,  80},  // E5
-  {659, 120, 160},  // E5
-  {659, 120, 160},  // E5
+  {659,  90,  20},  // E5
+  {659, 110, 160},  // E5
+  {659, 110, 140},  // E5
   {523, 120,  80},  // C5
-  {659, 120, 220},  // E5
-  {784, 160, 260},  // G5
+  {659, 120, 180},  // E5
+  {784, 150, 330},  // G5
   {392, 160,   0},  // G4
 };
 
-static bool     marioPlaying = false;
-static uint8_t  marioIdx = 0;
-static bool     marioToneOnPhase = false;
-static uint32_t marioNextMs = 0;
+// ---------- [3] Timer2-driven scheduler state (ALL used by ISR => volatile) ----------
+static volatile bool     marioPlaying = false;
+static volatile uint8_t  marioIdx = 0;
+static volatile bool     marioTonePhase = false;   // false = next is "tone ON", true = next is "gap"
+static volatile uint16_t marioRemainingMs = 0;     // countdown in ms for current phase
 
-// saved state to restore when finished
+// Saved Timer1 + PB1 state so we can restore cleanly after melody
 static uint8_t  savedTCCR1A, savedTCCR1B, savedTIMSK1;
 static uint16_t savedOCR1A, savedOCR1B, savedICR1, savedTCNT1;
-static uint8_t  savedDDRB, savedPORTB;
+static uint8_t  savedDDRB,  savedPORTB;
+
+// ---------- [4] Timer2 1ms tick (CTC) ----------
+static void marioTimer2Start_1msTick() {
+  // Timer2 in CTC mode, interrupt every 1ms.
+  //
+  // We pick prescaler = 64 and compute OCR2A from F_CPU:
+  // tick_hz = F_CPU / presc / (OCR2A+1)
+  // Want tick_hz = 1000 => OCR2A = F_CPU/(presc*1000) - 1
+  //
+  // For 16 MHz: OCR2A = 16000000/(64*1000)-1 = 249  (what I assumed earlier)
+  // For  8 MHz: OCR2A =  8000000/(64*1000)-1 = 124  (your case)
+
+  const uint32_t presc = 64UL;
+  uint32_t ocr = (F_CPU / (presc * 1000UL)) - 1UL;
+
+  // Keep within 8-bit range (0..255). For normal 8/16 MHz this is safe.
+  if (ocr > 255UL) ocr = 255UL;
+
+  TCCR2A = 0;
+  TCCR2B = 0;
+  TCNT2  = 0;
+
+  OCR2A  = (uint8_t)ocr;
+
+  TCCR2A = _BV(WGM21);                 // CTC
+  // Prescaler 64: CS22=1, CS21=0, CS20=0
+  TCCR2B = _BV(CS22);
+  TIMSK2 = _BV(OCIE2A);                // enable compare A interrupt
+}
+
+static void marioTimer2Stop() {
+  TIMSK2 = 0;        // disable Timer2 interrupts
+  TCCR2A = 0;
+  TCCR2B = 0;
+}
+
+// ---------- [5] ISR: advances the note schedule exactly in ms ----------
+ISR(TIMER2_COMPA_vect) {
+  if (!marioPlaying) return;
+
+  if (marioRemainingMs > 0) {
+    marioRemainingMs--;
+    return;
+  }
+
+  // Time to transition phase
+  if (marioIdx >= (sizeof(mario7) / sizeof(mario7[0]))) {
+    // finished
+    timer1StopOC1A();
+    PORTB &= ~_BV(PORTB1);
+    marioPlaying = false;
+    marioTimer2Stop();
+    return;
+  }
+
+  const MarioNote n = mario7[marioIdx]; // copy (safe, small)
+
+  if (!marioTonePhase) {
+    // Start tone phase
+    if (n.freq == 0) {
+      timer1StopOC1A();
+    } else {
+      timer1StartPwmOC1A(n.freq, MARIO_DUTY_PERMILLE);
+    }
+    marioRemainingMs = n.durMs;     // countdown tone duration
+    marioTonePhase = true;          // next transition will be "gap/off"
+  } else {
+    // Start gap phase (tone off)
+    timer1StopOC1A();
+    PORTB &= ~_BV(PORTB1);
+
+    marioRemainingMs = n.gapMs;     // countdown gap
+    marioTonePhase = false;         // next transition will be next note tone-on
+    marioIdx++;
+  }
+}
+
+// ---------- [6] Public controls (same names you already use) ----------
+bool marioIsPlaying() { return marioPlaying; }
 
 void marioStartNonBlocking() {
   if (marioPlaying) return;
 
+  // Make sure solenoid is not driven while we sing
   solenoidOff();
-  delay(10); // optional safety pause
+  delay(10);
 
-  // Save Timer1 + PB1
+  // Save Timer1 + PB1 state
   savedTCCR1A = TCCR1A; savedTCCR1B = TCCR1B; savedTIMSK1 = TIMSK1;
   savedOCR1A  = OCR1A;  savedOCR1B  = OCR1B;  savedICR1   = ICR1;  savedTCNT1 = TCNT1;
   savedDDRB   = DDRB;   savedPORTB  = PORTB;
 
+  // Stop Timer1 interrupts during melody (you already did this)
   TIMSK1 = 0;
 
-  marioPlaying = true;
+  // Arm scheduler
+  cli();
   marioIdx = 0;
-  marioToneOnPhase = false;      // first update will start tone
-  marioNextMs = millis();        // start immediately
+  marioTonePhase = false;  // next ISR transition starts tone immediately
+  marioRemainingMs = 0;    // force immediate start on next ISR tick
+  marioPlaying = true;
+  sei();
+
+  marioTimer2Start_1msTick(); // start 1ms metronome
 }
 
 static void marioStopAndRestore() {
-  timer1StopOC1A();
-  PORTB &= ~_BV(PORTB1); // keep gate low if still output
+  // Stop ISR scheduler first
+  marioPlaying = false;
+  marioTimer2Stop();
 
-  // Restore Timer1 (start clock last)
+  // Stop PWM and force low
+  timer1StopOC1A();
+  PORTB &= ~_BV(PORTB1);
+
+  // Restore Timer1 state (start clock last)
   TCCR1A = savedTCCR1A;
   OCR1A  = savedOCR1A;
   OCR1B  = savedOCR1B;
@@ -602,63 +696,21 @@ static void marioStopAndRestore() {
   TCCR1B = savedTCCR1B;
   TIMSK1 = savedTIMSK1;
 
+  // Restore PB1 direction + output state
   DDRB  = (DDRB  & ~_BV(DDB1))   | (savedDDRB  & _BV(DDB1));
   PORTB = (PORTB & ~_BV(PORTB1)) | (savedPORTB & _BV(PORTB1));
 
   solenoidOff();
-  marioPlaying = false;
 }
-
-void marioUpdateNonBlocking() {
-  if (!marioPlaying) return;
-
-  uint32_t now = millis();
-  if ((int32_t)(now - marioNextMs) < 0) return;
-
-  if (marioIdx >= (sizeof(mario7) / sizeof(mario7[0]))) {
-    marioStopAndRestore();
-    return;
-  }
-
-  const MarioNote &n = mario7[marioIdx];
-
-  if (!marioToneOnPhase) {
-    // start tone phase
-    if (n.freq == 0) {
-      timer1StopOC1A();
-      marioNextMs = now + n.durMs;   // treat dur as rest length
-      marioToneOnPhase = true;       // next phase will be gap/advance
-    } else {
-      timer1StartToggleOC1A(n.freq);
-      marioNextMs = now + n.durMs;
-      marioToneOnPhase = true;
-    }
-  } else {
-    // stop tone + gap, then advance
-    timer1StopOC1A();
-    PORTB &= ~_BV(PORTB1);
-    marioNextMs = now + n.gapMs;
-    marioToneOnPhase = false;
-    marioIdx++;
-  }
-}
-
-bool marioIsPlaying() { return marioPlaying; }
 
 void marioAbort() {
   if (!marioPlaying) return;
+  cli();
   marioStopAndRestore();
+  sei();
 }
 
-// -------- Blink to signal rtc alarm trigger worked ------
-void blinkRtcTrigger() {
-  for (uint8_t i = 0; i < 5; i++) {
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(400);
-    digitalWrite(LED_BUILTIN, LOW);
-    delay(400);
-  }
-}
+// --------- display init ---------------------------
 
 void initDisplays() {
   pinMode(TM_CLK,      OUTPUT); // this shared clk pin absolutely needs an external 10k pullup
@@ -764,8 +816,6 @@ void loop() {
       fireSolenoidWithSagMeasure(vIdle_mV, vSag_mV);
       uint8_t health = computeBatteryHealthPercent(vIdle_mV, vSag_mV);
       saveBatteryStatsToEEPROM(vIdle_mV, vSag_mV, health);
-
-      blinkRtcTrigger();
       setupRTCAlarm();
     }
 
@@ -780,40 +830,85 @@ void loop() {
     // --- Settings / display loop while main button held ---
     bool ledState = false;
     uint32_t lastBlink = millis();
-
-    // For edge-detect on the four adjust buttons
-    bool prevNowMinus  = false;
-    bool prevNowPlus   = false;
-    bool prevOpenMinus = false;
-    bool prevOpenPlus  = false;
+    uint32_t nextUiUpdateMs = 0;
+    bool currentTimeWasEdited = false;
 
     int buttonLowCount = 0;   // low-level filter counter
 
+    RepeatBtn rbNowMinus, rbNowPlus, rbOpenMinus, rbOpenPlus;
+
     marioStartNonBlocking();
 
+    // --- Phase-lock RTC time to millis() on an RTC second tick ---
+    DateTime  baseNow; 
+    uint32_t  baseNowMs = 0;
+    DateTime t0 = rtc.now();
+    uint8_t s0 = t0.second();
+
+    // Wait for RTC second to change (max ~1s)
     while (true) {
-      marioUpdateNonBlocking();
+      DateTime t1 = rtc.now();
+      if (t1.second() != s0) {
+        baseNow = t1;          // exact moment just after the tick
+        baseNowMs = millis();  // capture MCU time right then
+        break;
+      }
+    }
+    int32_t  editNowDeltaMin  = 0;               // shadow adjustment
+    int32_t  editOpenDeltaMin = 0;               // shadow adjustment
+    int32_t  shadowNowSec = (int32_t)baseNow.hour() * 3600
+                         + (int32_t)baseNow.minute() * 60
+                         + (int32_t)baseNow.second();
+    uint8_t baseOpenHour = openHour;
+    uint8_t baseOpenMin  = openMinute;
+
+    // helper lambdas (Arduino GCC supports lambdas fine)
+    auto wrapDayMin = [](int32_t m) -> int32_t {
+      const int32_t day = 24 * 60;
+      while (m < 0) m += day;
+      return m % day;
+    };
+
+    while (true) {
       bool buttonHigh = (digitalRead(BUTTON_PIN) == HIGH);
 
       if (!buttonHigh) {
         // Button is LOW: count how many consecutive times we see it low.
-        if (buttonLowCount < 100) buttonLowCount++;   // 100 * 10 ms ≈ 1 s
+        if (buttonLowCount < 200) buttonLowCount++;   // 200 * 1ms ≈ 200ms
       } else {
         buttonLowCount = 0; // any high resets the counter
       }
 
-      if (buttonLowCount >= 100 && !marioIsPlaying()) {
+      if (buttonLowCount >= 200 && !marioIsPlaying()) {
         // Consider this a "real" release → exit config mode
         break;
       }
 
-      // --- ONLY talk to RTC & displays while SW1 is actually ON ---
-      if (buttonHigh) {
-        DateTime now = rtc.now();
+      // --- ONLY do the expensive RTC+display stuff at 20 Hz when SW1 is held---
+      uint32_t nowMs = millis();
+      if (buttonHigh && (int32_t)(nowMs - nextUiUpdateMs) >= 0) {
+        nextUiUpdateMs = nowMs + (marioIsPlaying() ? 150 : 50); // 50 ms => 20 Hz
+        
+        // current time (shadowed)
+        uint32_t elapsedSec = (millis() - baseNowMs) / 1000UL;
+        int32_t baseSec = (int32_t)baseNow.hour() * 3600
+                        + (int32_t)baseNow.minute() * 60
+                        + (int32_t)baseNow.second();
+        int32_t nowSec = baseSec + (int32_t)elapsedSec + (int32_t)editNowDeltaMin * 60;
+        nowSec %= 86400; if (nowSec < 0) nowSec += 86400;
+        shadowNowSec = nowSec;  // <<< save for commit
+        int nowH = nowSec / 3600;
+        int nowM = (nowSec % 3600) / 60;
 
-        // Show current time and open time
-        showTime(displayCurrentTime, now.hour(), now.minute());
-        showTriggerTime(displayTriggerTime, openHour, openMinute);
+        // open time (shadowed)
+        int32_t baseOpenTot = baseOpenHour * 60 + baseOpenMin;
+        int32_t openTot = wrapDayMin(baseOpenTot + editOpenDeltaMin);
+        int openH = openTot / 60;
+        int openM = openTot % 60;
+
+        showTime(displayCurrentTime, nowH, nowM);
+        showTriggerTime(displayTriggerTime, openH, openM);
+
         showPercent(displayBat, percent);
 
         // Read buttons
@@ -822,38 +917,97 @@ void loop() {
         bool openMinus = digitalRead(BTN_TIME_OPEN_MINUS);
         bool openPlus  = digitalRead(BTN_TIME_OPEN_PLUS);
 
-        // Rising edges = one-step adjustment
-        if (nowMinus && !prevNowMinus) {
-          adjustCurrentTime(-1);
-        }
-        if (nowPlus && !prevNowPlus) {
-          adjustCurrentTime(+1);
-        }
-        if (openMinus && !prevOpenMinus) {
-          adjustOpenTime(-1);
-        }
-        if (openPlus && !prevOpenPlus) {
-          adjustOpenTime(+1);
+        uint32_t t = millis();
+
+        int s;
+
+        bool nowChanged = false;
+
+        // Current time -
+        s = updateRepeatButton(rbNowMinus, nowMinus, t);
+        if (s) { editNowDeltaMin -= s; nowChanged = true; }
+
+        // Current time +
+        s = updateRepeatButton(rbNowPlus, nowPlus, t);
+        if (s) { editNowDeltaMin += s; nowChanged = true; }
+
+        // If user touched "current time", re-anchor the shadow clock to :00 seconds NOW.
+        // This makes the next minute change happen 60s later, not "whatever RTC seconds were".
+        if (nowChanged) {
+          // Recompute the intended displayed time using current base + elapsed + delta
+          uint32_t elapsedSec = (millis() - baseNowMs) / 1000UL;
+          int32_t baseSec = (int32_t)baseNow.hour() * 3600
+                          + (int32_t)baseNow.minute() * 60
+                          + (int32_t)baseNow.second();
+
+          int32_t newSec = baseSec + (int32_t)elapsedSec + (int32_t)editNowDeltaMin * 60;
+          newSec %= 86400; if (newSec < 0) newSec += 86400;
+
+          int newH = newSec / 3600;
+          int newM = (newSec % 3600) / 60;
+
+          // Anchor to exactly HH:MM:00 starting right now
+          baseNow   = DateTime(baseNow.year(), baseNow.month(), baseNow.day(), newH, newM, 0);
+          baseNowMs = millis();
+
+          editNowDeltaMin = 0;                 // baked into baseNow
+          shadowNowSec    = newH * 3600 + newM * 60;  // keep commit state sane
+          currentTimeWasEdited = true;
         }
 
-        prevNowMinus  = nowMinus;
-        prevNowPlus   = nowPlus;
-        prevOpenMinus = openMinus;
-        prevOpenPlus  = openPlus;
+        // Open time -
+        s = updateRepeatButton(rbOpenMinus, openMinus, t);
+        if (s) editOpenDeltaMin -= s;
+
+        // Open time +
+        s = updateRepeatButton(rbOpenPlus, openPlus, t);
+        if (s) editOpenDeltaMin += s;
+
+        // also here: both open time + and open time - at the same time = fire solenoid
       }
 
       // Blink LED every 500 ms without blocking (independent of button)
-      uint32_t nowMs = millis();
       if (nowMs - lastBlink >= 500) {
         ledState = !ledState;
         digitalWrite(LED_BUILTIN, ledState);
         lastBlink = nowMs;
       }
 
-      delay(10);  // small debounce / loop delay
+      delay(1);  // small debounce / loop delay
     }
 
     // Leaving settings mode
+    // Commit shadow changes once (fast, deterministic)
+    if (currentTimeWasEdited) {
+      // Commit the *actual* shadow time at exit: baseNow + elapsed since baseNowMs
+      uint32_t elapsedSec = (millis() - baseNowMs) / 1000UL;
+
+      int32_t baseSec = (int32_t)baseNow.hour() * 3600
+                      + (int32_t)baseNow.minute() * 60
+                      + (int32_t)baseNow.second();
+
+      int32_t nowSec = baseSec + (int32_t)elapsedSec;
+      nowSec %= 86400; if (nowSec < 0) nowSec += 86400;
+
+      int nowH = nowSec / 3600;
+      int nowM = (nowSec % 3600) / 60;
+      int nowS = nowSec % 60;
+
+      DateTime newTime(baseNow.year(), baseNow.month(), baseNow.day(), nowH, nowM, nowS);
+      rtc.adjust(newTime);
+      setupRTCAlarm(); // since RTC time was changed - also sync when to do the alarm
+    }
+
+    if (editOpenDeltaMin != 0) {
+      int32_t baseOpenTot = baseOpenHour * 60 + baseOpenMin;
+      int32_t openTot = wrapDayMin(baseOpenTot + editOpenDeltaMin);
+      openHour   = openTot / 60;
+      openMinute = openTot % 60;
+
+      saveOpenTimeToEEPROM();
+      setupRTCAlarm();   // one reprogram
+    }
+
     digitalWrite(LED_BUILTIN, LOW);
     marioAbort();
 
