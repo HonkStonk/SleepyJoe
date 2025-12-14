@@ -7,6 +7,50 @@
 #include <EEPROM.h>          
 #include "RTClib.h"
 
+// -------------------- Debug: Serial dump --------------------
+#define DEBUG_SERIAL 1         // set to 0 to compile out all Serial debug
+
+#if DEBUG_SERIAL
+static void serialInitOnce() {
+  static bool inited = false;
+  if (inited) return;
+
+  Serial.begin(115200);
+  // Optional small wait so the USB-serial bridge can catch up (doesn't block long)
+  delay(10);
+  inited = true;
+}
+
+static void dumpBatteryEEPROM() {
+  serialInitOnce();
+
+  uint16_t vIdle = 0, vSag = 0;
+  uint8_t pct = 0;
+
+  bool ok = loadBatteryStatsFromEEPROM(vIdle, vSag, pct);
+
+  Serial.println(F("---- Battery EEPROM ----"));
+  Serial.print(F("magic ok: ")); Serial.println(ok ? F("YES") : F("NO"));
+
+  if (ok) {
+    Serial.print(F("vIdle_mV: ")); Serial.println(vIdle);
+    Serial.print(F("vSag_mV : ")); Serial.println(vSag);
+    Serial.print(F("health% : ")); Serial.println(pct);
+
+    // Also show derived things so you can sanity-check what your code *would* compute
+    uint8_t basePct = basePercentFromIdle(vIdle);
+    uint8_t sagPct  = sagHealthPercent(vIdle, vSag);
+    Serial.print(F("base%   : ")); Serial.println(basePct);
+    Serial.print(F("sag%    : ")); Serial.println(sagPct);
+
+    uint16_t duty = marioDutyFromPercent(pct);
+    Serial.print(F("marioDuty(permille): ")); Serial.println(duty);
+  }
+
+  Serial.println(F("------------------------"));
+}
+#endif
+
 // -------------------- Button helpers (must be near top to avoid Arduino auto-prototype issues) --------------------
 
 struct RepeatBtn {
@@ -40,7 +84,6 @@ TM1637Display displayTriggerTime(TM_CLK, TM_DIO_TRIG);
 
 // --- Solenoid (IRL540N low-side on D8) ---
 #define SOL_PIN 9
-#define MARIO_DUTY_PERMILLE  310   // 31.0% works good when health percent = 86% - and basePercentIdle = 99% - later auto compensate this
 
 // --- Powers DS3231 VCC+I2C pullups ---
 #define RTC_POWER_PIN 5
@@ -165,17 +208,17 @@ uint8_t sagHealthPercent(uint16_t vIdle_mV, uint16_t vSag_mV)
 
   // Thresholds in mV for 4% and 20% sag
   uint16_t th4_mV  = (uint32_t)vIdle_mV * 4  / 100;  // 4% of idle
-  uint16_t th20_mV = (uint32_t)vIdle_mV * 20 / 100;  // 20% of idle
+  uint16_t th45_mV = (uint32_t)vIdle_mV * 45 / 100;  // 45% of idle
 
   if (drop_mV <= th4_mV) {
     return 100;          // very little sag -> perfect
   }
-  if (drop_mV >= th20_mV) {
+  if (drop_mV >= th45_mV) {
     return 0;            // huge sag -> terrible
   }
 
   // Map drop_mV from [th4_mV..th20_mV] -> [100..0]
-  uint16_t span   = th20_mV - th4_mV;        // > 0
+  uint16_t span   = th45_mV - th4_mV;        // > 0
   uint16_t offset = drop_mV - th4_mV;        // 0..span
   uint16_t drop   = offset * 100UL / span;   // 0..100
 
@@ -511,6 +554,33 @@ void fireSolenoidWithSagMeasure(uint16_t &vIdle, uint16_t &vSag) {
   solenoidOff();
 }
 
+// -------------------- Melody volume compensator --------------------
+
+// Base duty at "good battery"
+static const uint16_t MARIO_DUTY_BASE_PERMILLE = 310;   // 31.0% at >=86% health
+
+// This is what the ISR will actually use (read inside TIMER2_COMPA ISR)
+static volatile uint16_t gMarioDutyPermille = MARIO_DUTY_BASE_PERMILLE;
+
+// Map battery percent -> duty (permille).
+// Rule: >=86% => 310‰, below that => increase duty.
+// Tune knobs:
+//  - PER_PERCENT_UP: how many permille to add per missing percent below 86
+//  - MAX_DUTY: absolute safety cap (timer1Start already caps at 900, but keep this sane)
+static uint16_t marioDutyFromPercent(uint8_t pct) {
+  const uint8_t  THRESH_PCT      = 86;
+  const uint16_t PER_PERCENT_UP  = 6;    // 6‰ per % below 86 -> 0% => 310 + 86*6 = 826‰
+  const uint16_t MAX_DUTY        = 850;  // keep a little headroom under 900
+
+  if (pct >= THRESH_PCT) return MARIO_DUTY_BASE_PERMILLE;
+
+  uint8_t deficit = (uint8_t)(THRESH_PCT - pct);  // 1..86
+  uint32_t duty = (uint32_t)MARIO_DUTY_BASE_PERMILLE + (uint32_t)deficit * PER_PERCENT_UP;
+
+  if (duty > MAX_DUTY) duty = MAX_DUTY;
+  return (uint16_t)duty;
+}
+
 // -------------------- Mario melody on SOL_PIN (D9 / OC1A / Timer1) --------------------
 // Interrupt-driven scheduler via Timer2 (1ms tick). Timer0 (millis) is untouched.
 // D9 on ATmega328P = PB1 = OC1A
@@ -634,7 +704,7 @@ ISR(TIMER2_COMPA_vect) {
     if (n.freq == 0) {
       timer1StopOC1A();
     } else {
-      timer1StartPwmOC1A(n.freq, MARIO_DUTY_PERMILLE);
+      timer1StartPwmOC1A(n.freq, gMarioDutyPermille);
     }
     marioRemainingMs = n.durMs;     // countdown tone duration
     marioTonePhase = true;          // next transition will be "gap/off"
@@ -826,6 +896,12 @@ void loop() {
       vIdle_mV = (uint16_t)readVccFiltered(6);
       percent = basePercentFromIdle(vIdle_mV);
     }
+    #if DEBUG_SERIAL
+      dumpBatteryEEPROM();
+    #endif
+
+    // Set Mario PWM duty from the best-known battery percent (health or fallback idle-percent)
+    gMarioDutyPermille = marioDutyFromPercent((uint8_t)percent);
 
     // --- Settings / display loop while main button held ---
     bool ledState = false;
@@ -837,7 +913,7 @@ void loop() {
 
     RepeatBtn rbNowMinus, rbNowPlus, rbOpenMinus, rbOpenPlus;
 
-    marioStartNonBlocking();
+    if(woke) { marioStartNonBlocking(); } // only mario on config button
 
     // --- Phase-lock RTC time to millis() on an RTC second tick ---
     DateTime  baseNow; 
