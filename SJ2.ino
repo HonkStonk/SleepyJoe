@@ -970,6 +970,7 @@ void loop() {
     int buttonLowCount = 0;   // low-level filter counter
 
     RepeatBtn rbNowMinus, rbNowPlus, rbOpenMinus, rbOpenPlus;
+    bool openChordLatched = false;   // prevents repeat while held
 
     if(woke) { marioStartNonBlocking(); } // only mario on config button
 
@@ -1089,15 +1090,42 @@ void loop() {
           currentTimeWasEdited = true;
         }
 
-        // Open time -
-        s = updateRepeatButton(rbOpenMinus, openMinus, t);
-        if (s) editOpenDeltaMin -= s;
+        // ---- CHORD: Open- and Open+ held together => fire solenoid once ----
+        bool openChord = openMinus && openPlus;
 
-        // Open time +
-        s = updateRepeatButton(rbOpenPlus, openPlus, t);
-        if (s) editOpenDeltaMin += s;
+        if (openChord) {
+          // Latch so it fires only once per hold
+          if (!openChordLatched) {
+            openChordLatched = true;
 
-        // also here: both open time + and open time - at the same time = fire solenoid
+            // Abort melody so Timer1 / solenoid pin state is clean
+            if (marioIsPlaying()) marioAbort();
+
+            // Run exactly the RTC-wake sag-measure sequence
+            fireSolenoidWithSagMeasure(vIdle_mV, vSag_mV);
+            uint8_t health = computeBatteryHealthPercent(vIdle_mV, vSag_mV);
+            saveBatteryStatsToEEPROM(vIdle_mV, vSag_mV, health);
+
+            // Optional: update the displayed percent immediately
+            percent = health;
+            gMarioDutyPermille = marioDutyFromPercent((uint8_t)percent);
+          }
+
+          // IMPORTANT: while chord is held, do NOT allow open time +/- to change
+          // So skip calling updateRepeatButton() for open buttons this cycle.
+        } else {
+          // Chord released => allow it to trigger again next time
+          openChordLatched = false;
+
+          // Normal open-time editing follows (your existing code)
+          int s;
+
+          s = updateRepeatButton(rbOpenMinus, openMinus, t);
+          if (s) editOpenDeltaMin -= s;
+
+          s = updateRepeatButton(rbOpenPlus, openPlus, t);
+          if (s) editOpenDeltaMin += s;
+        }
       }
 
       // Blink LED every 500 ms without blocking (independent of button)
