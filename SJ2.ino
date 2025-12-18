@@ -798,6 +798,54 @@ void initDisplays() {
   displayTriggerTime.clear();
 }
 
+// i2c recover since now dynamically powering its vcc/pullups - was quirky especially when it woke everything by its int pin
+
+static void i2cBusRecover() {
+  const uint8_t SCL = A5;
+  const uint8_t SDA = A4;
+
+  // Release both lines first
+  pinMode(SCL, INPUT);
+  pinMode(SDA, INPUT);
+  delayMicroseconds(50);
+
+  // If SDA stuck low, clock SCL (drive low, release high)
+  if (digitalRead(SDA) == LOW) {
+    for (uint8_t i = 0; i < 16; i++) {   // 9 is typical; 16 is fine
+      pinMode(SCL, OUTPUT);
+      digitalWrite(SCL, LOW);
+      delayMicroseconds(6);
+
+      pinMode(SCL, INPUT);               // release -> pullup makes it HIGH
+      delayMicroseconds(6);
+
+      if (digitalRead(SDA) == HIGH) break;
+    }
+  }
+
+  // STOP condition: SDA low while SCL high, then SDA high
+  pinMode(SDA, OUTPUT);
+  digitalWrite(SDA, LOW);
+  delayMicroseconds(6);
+
+  pinMode(SCL, INPUT);                   // ensure SCL released high
+  delayMicroseconds(6);
+
+  pinMode(SDA, INPUT);                   // release SDA high
+  delayMicroseconds(6);
+}
+
+static void twiReset() {
+  // Disable TWI
+  TWCR = 0;
+  // Clear status
+  TWSR = 0;
+  // Bit rate (doesn't matter much here)
+  TWBR = 72; // ~100kHz at 16MHz
+  // Re-enable
+  TWCR = _BV(TWEN);
+}
+
 void preparePinsForSleep() {
   // TM1637 modules – make sure they are high-Z to avoid backfeeding +4V
   pinMode(TM_CLK,       INPUT); digitalWrite(TM_CLK,       LOW);
@@ -831,7 +879,7 @@ void setup() {
 
   pinMode(RTC_POWER_PIN, OUTPUT);
   digitalWrite(RTC_POWER_PIN, HIGH);   // power on DS3231 VCC + I2C pullups
-  delay(25);                           // let the rail/pullups settle
+  delay(350);                           // let the rail/pullups settle
 
   Wire.begin();  // initialize I2C first
   rtc.begin();   // init RTC
@@ -870,10 +918,20 @@ void loop() {
     pinMode(RTC_POWER_PIN, OUTPUT);
     digitalWrite(RTC_POWER_PIN, HIGH); // turns on DS3231 VCC+I2C pullups
     pinMode(BUTTON_PIN, INPUT);
-    delay(150);        // power rail settle
-    Wire.begin();      // (already done in setup, but harmless)
+    delay(20);        // power rail settle
+    i2cBusRecover();
+    #if DEBUG_SERIAL
+      serialInitOnce();
+      Serial.print(F("SDA=")); Serial.print(digitalRead(A4));
+      Serial.print(F(" SCL=")); Serial.println(digitalRead(A5));
+    #endif
+    twiReset(); 
+    Wire.begin();     
+    #if defined(TWCR) // basically AVR
+      Wire.setWireTimeout(25000, true); // 25ms, reset TWI on timeout
+    #endif
     initDisplays();
-    delay(150);        // I2C/RTC settle (or just “system settle”)
+    delay(250);        // I2C/RTC settle (or just “system settle”)
 
     uint16_t vIdle_mV = 0, vSag_mV = 0;
     uint8_t last_healthPct = 0;
