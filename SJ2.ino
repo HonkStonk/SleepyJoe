@@ -1,3 +1,6 @@
+struct BatteryLogRecord;
+struct BatteryLogRecordV1;
+
 #include <avr/sleep.h>
 #include <avr/power.h>
 #include <Arduino.h>
@@ -19,35 +22,6 @@ static void serialInitOnce() {
   // Optional small wait so the USB-serial bridge can catch up (doesn't block long)
   delay(10);
   inited = true;
-}
-
-static void dumpBatteryEEPROM() {
-  serialInitOnce();
-
-  uint16_t vIdle = 0, vSag = 0;
-  uint8_t pct = 0;
-
-  bool ok = loadBatteryStatsFromEEPROM(vIdle, vSag, pct);
-
-  Serial.println(F("---- Battery EEPROM ----"));
-  Serial.print(F("magic ok: ")); Serial.println(ok ? F("YES") : F("NO"));
-
-  if (ok) {
-    Serial.print(F("vIdle_mV: ")); Serial.println(vIdle);
-    Serial.print(F("vSag_mV : ")); Serial.println(vSag);
-    Serial.print(F("health% : ")); Serial.println(pct);
-
-    // Also show derived things so you can sanity-check what your code *would* compute
-    uint8_t basePct = basePercentFromIdle(vIdle);
-    uint8_t sagPct  = sagHealthPercent(vIdle, vSag);
-    Serial.print(F("base%   : ")); Serial.println(basePct);
-    Serial.print(F("sag%    : ")); Serial.println(sagPct);
-
-    uint16_t duty = marioDutyFromPercent(pct);
-    Serial.print(F("marioDuty(permille): ")); Serial.println(duty);
-  }
-
-  Serial.println(F("------------------------"));
 }
 #endif
 
@@ -95,7 +69,7 @@ TM1637Display displayTriggerTime(TM_CLK, TM_DIO_TRIG);
 #define EEPROM_OPEN_MIN_ADDR   2
 #define EEPROM_MAGIC_VALUE   0x42
 
-// --- EEPROM layout for battery stats ---
+// --- EEPROM layout for battery stats (legacy single-record) ---
 #define EEPROM_BATT_MAGIC_ADDR   10
 #define EEPROM_BATT_VIDLE_L      11
 #define EEPROM_BATT_VIDLE_H      12
@@ -104,8 +78,42 @@ TM1637Display displayTriggerTime(TM_CLK, TM_DIO_TRIG);
 #define EEPROM_BATT_PCT_ADDR     15
 #define EEPROM_BATT_MAGIC_VALUE  0xB7
 
-// --- Open/alarm time (default 02:30) ---
-uint8_t openHour   = 2;
+// -------------------- EEPROM log config --------------------
+static constexpr int LOG_SLOTS = 31;
+static constexpr int EEPROM_LOG_BASE = 8;
+
+// 14-byte record (packed)
+struct __attribute__((packed)) BatteryLogRecord {
+  uint16_t vIdle_mV;
+  uint16_t vSag_mV;
+  uint8_t  health_pct;
+  int16_t  temp_centiC;
+  uint8_t  profile;
+  uint32_t seq;
+  uint16_t magic;
+};
+
+// Legacy 13-byte record (packed)
+struct __attribute__((packed)) BatteryLogRecordV1 {
+  uint16_t vIdle_mV;
+  uint16_t vSag_mV;
+  uint8_t  health_pct;
+  int16_t  temp_centiC;
+  uint32_t seq;
+  uint16_t magic;
+};
+
+static constexpr uint16_t REC_MAGIC_V1 = 0xB10B;
+static constexpr uint16_t REC_MAGIC = 0xB10C;
+static constexpr uint8_t PROFILE_LIGHT = 0;
+static constexpr uint8_t PROFILE_HEAVY = 1;
+static constexpr uint8_t PROFILE_UNKNOWN = 0xFF;
+static constexpr int EEPROM_TIME_LOG_BASE = EEPROM_LOG_BASE + LOG_SLOTS * (int)sizeof(BatteryLogRecord);
+static constexpr int EEPROM_TIME_LOG_BASE_V1 = EEPROM_LOG_BASE + LOG_SLOTS * (int)sizeof(BatteryLogRecordV1);
+static constexpr uint16_t TIME_UNKNOWN = 0xFFFF;
+
+// --- Open/alarm time (default 12:30) ---
+uint8_t openHour   = 12;
 uint8_t openMinute = 30;
 
 volatile bool woke    = false;
@@ -343,18 +351,137 @@ void saveOpenTimeToEEPROM() {
   EEPROM.update(EEPROM_OPEN_MIN_ADDR, openMinute);
 }
 
-// -------------------- EEPROM helpers (battery stats) ---------
+// -------------------- EEPROM helpers (battery stats log) ---------
 
-void saveBatteryStatsToEEPROM(uint16_t vIdle, uint16_t vSag, uint8_t pct) {
-  EEPROM.update(EEPROM_BATT_MAGIC_ADDR, EEPROM_BATT_MAGIC_VALUE);
-  EEPROM.update(EEPROM_BATT_VIDLE_L, lowByte(vIdle));
-  EEPROM.update(EEPROM_BATT_VIDLE_H, highByte(vIdle));
-  EEPROM.update(EEPROM_BATT_VSAG_L,  lowByte(vSag));
-  EEPROM.update(EEPROM_BATT_VSAG_H,  highByte(vSag));
-  EEPROM.update(EEPROM_BATT_PCT_ADDR, pct);
+static int slotAddr(int slot) {
+  return EEPROM_LOG_BASE + slot * (int)sizeof(BatteryLogRecord);
 }
 
-bool loadBatteryStatsFromEEPROM(uint16_t &vIdle, uint16_t &vSag, uint8_t &pct) {
+static bool readRec(int slot, BatteryLogRecord &r) {
+  EEPROM.get(slotAddr(slot), r);
+  return (r.magic == REC_MAGIC);
+}
+
+static void writeRec(int slot, const BatteryLogRecord &r) {
+  EEPROM.put(slotAddr(slot), r);
+}
+
+static int slotAddrV1(int slot) {
+  return EEPROM_LOG_BASE + slot * (int)sizeof(BatteryLogRecordV1);
+}
+
+static bool readRecV1(int slot, BatteryLogRecordV1 &r) {
+  EEPROM.get(slotAddrV1(slot), r);
+  return (r.magic == REC_MAGIC_V1);
+}
+
+static int timeSlotAddr(int slot) {
+  return EEPROM_TIME_LOG_BASE + slot * (int)sizeof(uint16_t);
+}
+
+static void writeTimeSlot(int slot, uint16_t time_hhmm) {
+  EEPROM.put(timeSlotAddr(slot), time_hhmm);
+}
+
+static uint16_t readTimeSlot(int slot) {
+  uint16_t t;
+  EEPROM.get(timeSlotAddr(slot), t);
+  return t;
+}
+
+static uint16_t readTimeSlotV1(int slot) {
+  uint16_t t;
+  EEPROM.get(EEPROM_TIME_LOG_BASE_V1 + slot * (int)sizeof(uint16_t), t);
+  return t;
+}
+
+static void findNewest(int &newestSlot, uint32_t &newestSeq, int &validCount) {
+  newestSlot = -1;
+  newestSeq = 0;
+  validCount = 0;
+
+  for (int s = 0; s < LOG_SLOTS; s++) {
+    BatteryLogRecord r;
+    if (!readRec(s, r)) continue;
+
+    validCount++;
+    if (newestSlot < 0 || r.seq > newestSeq) {
+      newestSlot = s;
+      newestSeq = r.seq;
+    }
+  }
+}
+
+static bool migrateV1LogIfNeeded() {
+  int newestSlotV1 = -1;
+  uint32_t newestSeqV1 = 0;
+  int countV1 = 0;
+
+  for (int s = 0; s < LOG_SLOTS; s++) {
+    BatteryLogRecordV1 r;
+    if (!readRecV1(s, r)) continue;
+
+    countV1++;
+    if (newestSlotV1 < 0 || r.seq > newestSeqV1) {
+      newestSlotV1 = s;
+      newestSeqV1 = r.seq;
+    }
+  }
+
+  if (countV1 == 0) return false;
+
+  static BatteryLogRecordV1 oldRecs[LOG_SLOTS];
+  static uint16_t oldTimes[LOG_SLOTS];
+  static uint8_t oldValid[LOG_SLOTS];
+
+  for (int s = 0; s < LOG_SLOTS; s++) {
+    BatteryLogRecordV1 r;
+    if (readRecV1(s, r)) {
+      oldRecs[s] = r;
+      oldTimes[s] = readTimeSlotV1(s);
+      oldValid[s] = 1;
+    } else {
+      oldValid[s] = 0;
+      oldTimes[s] = TIME_UNKNOWN;
+    }
+  }
+
+  BatteryLogRecord blank{};
+  blank.magic = 0;
+  for (int s = 0; s < LOG_SLOTS; s++) {
+    writeRec(s, blank);
+    writeTimeSlot(s, TIME_UNKNOWN);
+  }
+
+  uint32_t oldestSeq = newestSeqV1 - (uint32_t)(countV1 - 1);
+  int newSlot = 0;
+  for (int i = 0; i < countV1 && newSlot < LOG_SLOTS; i++) {
+    uint32_t seq = oldestSeq + (uint32_t)i;
+    int offset = (int)(newestSeqV1 - seq);
+    int slot = newestSlotV1 - offset;
+    while (slot < 0) slot += LOG_SLOTS;
+    slot %= LOG_SLOTS;
+
+    if (!oldValid[slot]) continue;
+
+    BatteryLogRecord r{};
+    r.vIdle_mV = oldRecs[slot].vIdle_mV;
+    r.vSag_mV = oldRecs[slot].vSag_mV;
+    r.health_pct = oldRecs[slot].health_pct;
+    r.temp_centiC = oldRecs[slot].temp_centiC;
+    r.profile = PROFILE_UNKNOWN;
+    r.seq = oldRecs[slot].seq;
+    r.magic = REC_MAGIC;
+
+    writeRec(newSlot, r);
+    writeTimeSlot(newSlot, oldTimes[slot]);
+    newSlot++;
+  }
+
+  return true;
+}
+
+static bool legacyStatsAvailable(uint16_t &vIdle, uint16_t &vSag, uint8_t &pct) {
   if (EEPROM.read(EEPROM_BATT_MAGIC_ADDR) != EEPROM_BATT_MAGIC_VALUE) {
     return false;
   }
@@ -367,6 +494,207 @@ bool loadBatteryStatsFromEEPROM(uint16_t &vIdle, uint16_t &vSag, uint8_t &pct) {
   pct   = EEPROM.read(EEPROM_BATT_PCT_ADDR);
   return true;
 }
+
+static void migrateLegacyStatsIfNeeded() {
+  int newestSlot;
+  uint32_t newestSeq;
+  int count;
+  findNewest(newestSlot, newestSeq, count);
+  if (count > 0) return;
+
+  if (migrateV1LogIfNeeded()) return;
+
+  uint16_t vIdle = 0, vSag = 0;
+  uint8_t pct = 0;
+  if (!legacyStatsAvailable(vIdle, vSag, pct)) return;
+
+  BatteryLogRecord r{};
+  r.vIdle_mV = vIdle;
+  r.vSag_mV = vSag;
+  r.health_pct = pct;
+  r.temp_centiC = 0;
+  r.profile = PROFILE_UNKNOWN;
+  r.seq = 1UL;
+  r.magic = REC_MAGIC;
+  writeRec(0, r);
+  writeTimeSlot(0, TIME_UNKNOWN);
+}
+
+static bool getNewestBatteryLog(BatteryLogRecord &r) {
+  migrateLegacyStatsIfNeeded();
+
+  int newestSlot;
+  uint32_t newestSeq;
+  int count;
+  findNewest(newestSlot, newestSeq, count);
+  if (newestSlot < 0) return false;
+  return readRec(newestSlot, r);
+}
+
+static bool shouldUseHeavyProfile(int16_t temp_centiC) {
+  uint8_t lastHealth = 100;
+  BatteryLogRecord r;
+  if (getNewestBatteryLog(r)) {
+    lastHealth = r.health_pct;
+  }
+  return (lastHealth < 30) || (temp_centiC < -500);
+}
+
+void logBatteryStats(uint16_t vIdle_mV,
+                     uint16_t vSag_mV,
+                     uint8_t health_pct,
+                     int16_t temp_centiC,
+                     uint8_t profile)
+{
+  migrateLegacyStatsIfNeeded();
+
+  DateTime now = rtc.now();
+  uint16_t time_hhmm = (uint16_t)(now.hour() * 100 + now.minute());
+
+  int newestSlot;
+  uint32_t newestSeq;
+  int count;
+  findNewest(newestSlot, newestSeq, count);
+
+  int nextSlot = (newestSlot < 0) ? 0 : (newestSlot + 1) % LOG_SLOTS;
+
+  BatteryLogRecord r{};
+  r.vIdle_mV = vIdle_mV;
+  r.vSag_mV = vSag_mV;
+  r.health_pct = health_pct;
+  r.temp_centiC = temp_centiC;
+  r.profile = profile;
+  r.seq = (newestSlot < 0) ? 1UL : (newestSeq + 1UL);
+  r.magic = REC_MAGIC;
+
+  writeRec(nextSlot, r);
+  writeTimeSlot(nextSlot, time_hhmm);
+}
+
+bool loadBatteryStatsFromEEPROM(uint16_t &vIdle, uint16_t &vSag, uint8_t &pct) {
+  migrateLegacyStatsIfNeeded();
+
+  int newestSlot;
+  uint32_t newestSeq;
+  int count;
+  findNewest(newestSlot, newestSeq, count);
+  if (newestSlot < 0) return false;
+
+  BatteryLogRecord r;
+  if (!readRec(newestSlot, r)) return false;
+
+  vIdle = r.vIdle_mV;
+  vSag  = r.vSag_mV;
+  pct   = r.health_pct;
+  return true;
+}
+
+static int16_t readRtcTempCentiC() {
+  float tC = rtc.getTemperature();
+  if (tC >= 0.0f) {
+    return (int16_t)(tC * 100.0f + 0.5f);
+  }
+  return (int16_t)(tC * 100.0f - 0.5f);
+}
+
+#if DEBUG_SERIAL
+static void printTempCentiC(int16_t temp_centiC) {
+  if (temp_centiC < 0) {
+    Serial.print('-');
+    temp_centiC = (int16_t)(-temp_centiC);
+  }
+  int16_t whole = temp_centiC / 100;
+  int16_t frac  = temp_centiC % 100;
+  Serial.print(whole);
+  Serial.print('.');
+  if (frac < 10) Serial.print('0');
+  Serial.print(frac);
+}
+
+static void printProfileByte(uint8_t profile) {
+  if (profile == PROFILE_HEAVY) {
+    Serial.print('H');
+  } else if (profile == PROFILE_LIGHT) {
+    Serial.print('L');
+  } else {
+    Serial.print('?');
+  }
+}
+
+static bool isValidTimeHHMM(uint16_t time_hhmm) {
+  uint8_t hh = time_hhmm / 100;
+  uint8_t mm = time_hhmm % 100;
+  return (hh < 24 && mm < 60);
+}
+
+static void printTimeHHMM(uint16_t time_hhmm) {
+  if (!isValidTimeHHMM(time_hhmm)) {
+    Serial.print(F("--:--"));
+    return;
+  }
+  uint8_t hh = time_hhmm / 100;
+  uint8_t mm = time_hhmm % 100;
+  if (hh < 10) Serial.print('0');
+  Serial.print(hh);
+  Serial.print(':');
+  if (mm < 10) Serial.print('0');
+  Serial.print(mm);
+}
+
+static void dumpBatteryEEPROM() {
+  serialInitOnce();
+
+  migrateLegacyStatsIfNeeded();
+  int newestSlot;
+  uint32_t newestSeq;
+  int count;
+  findNewest(newestSlot, newestSeq, count);
+
+  Serial.println(F("---- Battery EEPROM Log ----"));
+  if (newestSlot < 0 || count == 0) {
+    Serial.println(F("no records"));
+    Serial.println(F("----------------------------"));
+    return;
+  }
+
+  uint32_t oldestSeq = newestSeq - (uint32_t)(count - 1);
+  Serial.print(F("records: ")); Serial.println(count);
+  Serial.print(F("oldest seq: ")); Serial.print(oldestSeq);
+  Serial.print(F(" newest seq: ")); Serial.println(newestSeq);
+
+  for (int i = 0; i < count; i++) {
+    uint32_t seq = oldestSeq + (uint32_t)i;
+    int offset = (int)(newestSeq - seq); // 0..LOG_SLOTS-1
+    int slot = newestSlot - offset;
+    while (slot < 0) slot += LOG_SLOTS;
+    slot %= LOG_SLOTS;
+
+    BatteryLogRecord r;
+    if (!readRec(slot, r)) {
+      Serial.print(F("#")); Serial.print(i + 1);
+      Serial.print(F(" slot=")); Serial.print(slot);
+      Serial.println(F(" invalid"));
+      continue;
+    }
+
+    Serial.print(F("#"));
+    if (i + 1 < 10) Serial.print('0');
+    Serial.print(i + 1);
+    Serial.print(F(" seq=")); Serial.print(r.seq);
+    Serial.print(F(" vIdle=")); Serial.print(r.vIdle_mV);
+    Serial.print(F(" vSag=")); Serial.print(r.vSag_mV);
+    Serial.print(F(" health=")); Serial.print(r.health_pct);
+    uint16_t time_hhmm = readTimeSlot(slot);
+
+    Serial.print(F(" tempC=")); printTempCentiC(r.temp_centiC);
+    Serial.print(F(" profile=")); printProfileByte(r.profile);
+    Serial.print(F(" time=")); printTimeHHMM(time_hhmm);
+    Serial.println();
+  }
+
+  Serial.println(F("----------------------------"));
+}
+#endif
 
 // -------------------- DS3231 low-level config ---------
 
@@ -531,26 +859,40 @@ void hammerSolenoidBuzz() {
   }
 }
 
-void fireSolenoidWithSagMeasure(uint16_t &vIdle, uint16_t &vSag) {
+void fireSolenoidWithSagMeasure(uint16_t &vIdle, uint16_t &vSag, bool heavyProfile) {
+  const uint16_t firstOnMs = heavyProfile ? 200 : 100;
+  const uint8_t  pulseCount = heavyProfile ? 20 : 10;
+  const uint16_t finalOnMs = heavyProfile ? 200 : 100;
+  const uint16_t pulseOnMs = 20;
+  const uint16_t pulseOffMs = 40;
+  const uint16_t gapMs = 300;
+
   // 1) Idle
   vIdle = (uint16_t)readVccFiltered(6);
 
-  // 2) Start pulse 1
-  uint32_t t0 = millis();
+  // 2) Start first pulse (sag measurement 20 ms into the pulse)
   solenoidOn();
-  delay(20);  // let the sag settle
-
-  // 3) Measure under load
+  delay(20);
   vSag = (uint16_t)readVccFiltered(4);
 
-  // 4) Keep holding to reach 120 ms total
-  while (millis() - t0 < 120) { /* wait */ }
+  if (firstOnMs > 20) {
+    delay(firstOnMs - 20);
+  }
   solenoidOff();
 
-  // 5) Gap, then second 120 ms pulse (no more measuring needed)
-  delay(300);
+  // 3) Gap, then burst train
+  delay(gapMs);
+  for (uint8_t i = 0; i < pulseCount; i++) {
+    solenoidOn();
+    delay(pulseOnMs);
+    solenoidOff();
+    delay(pulseOffMs);
+  }
+
+  // 4) Gap, then final pulse
+  delay(gapMs);
   solenoidOn();
-  delay(120);
+  delay(finalOnMs);
   solenoidOff();
 }
 
@@ -579,6 +921,28 @@ static uint16_t marioDutyFromPercent(uint8_t pct) {
 
   if (duty > MAX_DUTY) duty = MAX_DUTY;
   return (uint16_t)duty;
+}
+
+static void playExitMelody() {
+  const uint16_t NOTE_HIGH = 784; // G5
+  const uint16_t NOTE_LOW  = 523; // C5
+  const uint16_t NOTE_MS   = 120;
+  const uint16_t GAP_MS    = 70;
+
+  solenoidOff();
+  delay(10);
+
+  timer1StartPwmOC1A(NOTE_HIGH, gMarioDutyPermille);
+  delay(NOTE_MS);
+  timer1StopOC1A();
+  delay(GAP_MS);
+
+  timer1StartPwmOC1A(NOTE_LOW, gMarioDutyPermille);
+  delay(NOTE_MS);
+  timer1StopOC1A();
+
+  delay(10);
+  solenoidOff();
 }
 
 // -------------------- Mario melody on SOL_PIN (D9 / OC1A / Timer1) --------------------
@@ -941,9 +1305,12 @@ void loop() {
     if (rtcWake) {
       rtc.clearAlarm(2);   // clear the latched A2F flag (releases INT/SQW)
       if (marioIsPlaying()) marioAbort();
-      fireSolenoidWithSagMeasure(vIdle_mV, vSag_mV);
+      int16_t temp_centiC = readRtcTempCentiC();
+      bool heavyProfile = shouldUseHeavyProfile(temp_centiC);
+      fireSolenoidWithSagMeasure(vIdle_mV, vSag_mV, heavyProfile);
       uint8_t health = computeBatteryHealthPercent(vIdle_mV, vSag_mV);
-      saveBatteryStatsToEEPROM(vIdle_mV, vSag_mV, health);
+      uint8_t profile = heavyProfile ? PROFILE_HEAVY : PROFILE_LIGHT;
+      logBatteryStats(vIdle_mV, vSag_mV, health, temp_centiC, profile);
       setupRTCAlarm();
     }
 
@@ -1102,9 +1469,12 @@ void loop() {
             if (marioIsPlaying()) marioAbort();
 
             // Run exactly the RTC-wake sag-measure sequence
-            fireSolenoidWithSagMeasure(vIdle_mV, vSag_mV);
+            int16_t temp_centiC = readRtcTempCentiC();
+            bool heavyProfile = shouldUseHeavyProfile(temp_centiC);
+            fireSolenoidWithSagMeasure(vIdle_mV, vSag_mV, heavyProfile);
             uint8_t health = computeBatteryHealthPercent(vIdle_mV, vSag_mV);
-            saveBatteryStatsToEEPROM(vIdle_mV, vSag_mV, health);
+            uint8_t profile = heavyProfile ? PROFILE_HEAVY : PROFILE_LIGHT;
+            logBatteryStats(vIdle_mV, vSag_mV, health, temp_centiC, profile);
 
             // Optional: update the displayed percent immediately
             percent = health;
@@ -1171,7 +1541,11 @@ void loop() {
     }
 
     digitalWrite(LED_BUILTIN, LOW);
+    bool playExit = woke;
     marioAbort();
+    if (playExit) {
+      playExitMelody();
+    }
 
     woke    = false;
     rtcWake = false;
