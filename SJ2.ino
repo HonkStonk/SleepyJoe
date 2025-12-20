@@ -874,7 +874,7 @@ void fireSolenoidWithSagMeasure(uint16_t &vIdle, uint16_t &vSag, bool heavyProfi
   solenoidOn();
   uint32_t t0 = millis();
   delay(20);
-  vSag = (uint16_t)readVccFiltered(10);
+  vSag = (uint16_t)readVccFiltered(5);
 
   uint32_t elapsedMs = millis() - t0;
   if (elapsedMs < firstOnMs) {
