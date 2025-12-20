@@ -197,9 +197,9 @@ long readVccFiltered(uint8_t samples) {
 }
 
 uint8_t basePercentFromIdle(uint16_t vIdle_mV) {
-  if (vIdle_mV > 4700) vIdle_mV = 4700;
+  if (vIdle_mV > 4900) vIdle_mV = 4900;
   if (vIdle_mV < 3000) vIdle_mV = 3000;
-  long pct = (long)(vIdle_mV - 3000) * 100L / 1700L;
+  long pct = (long)(vIdle_mV - 3000) * 100L / 1900L;
   if (pct < 0)   pct = 0;
   if (pct > 100)  pct = 100;
   return (uint8_t)pct;
@@ -868,15 +868,17 @@ void fireSolenoidWithSagMeasure(uint16_t &vIdle, uint16_t &vSag, bool heavyProfi
   const uint16_t gapMs = 300;
 
   // 1) Idle
-  vIdle = (uint16_t)readVccFiltered(6);
+  vIdle = (uint16_t)readVccFiltered(10);
 
   // 2) Start first pulse (sag measurement 20 ms into the pulse)
   solenoidOn();
+  uint32_t t0 = millis();
   delay(20);
-  vSag = (uint16_t)readVccFiltered(4);
+  vSag = (uint16_t)readVccFiltered(10);
 
-  if (firstOnMs > 20) {
-    delay(firstOnMs - 20);
+  uint32_t elapsedMs = millis() - t0;
+  if (elapsedMs < firstOnMs) {
+    delay((uint16_t)(firstOnMs - elapsedMs));
   }
   solenoidOff();
 
