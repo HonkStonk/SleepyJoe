@@ -495,29 +495,45 @@ static bool legacyStatsAvailable(uint16_t &vIdle, uint16_t &vSag, uint8_t &pct) 
   return true;
 }
 
+static void fixWrappedLogTemps() {
+  // DS3231 valid range is -40..85 C; old logs can store wrapped unsigned values.
+  for (int s = 0; s < LOG_SLOTS; s++) {
+    BatteryLogRecord r;
+    if (!readRec(s, r)) continue;
+
+    if (r.temp_centiC > 10000) { // > 100.00 C is always bogus here
+      r.temp_centiC = (int16_t)(r.temp_centiC - 25600); // unwrap signed byte
+      writeRec(s, r);
+    }
+  }
+}
+
 static void migrateLegacyStatsIfNeeded() {
   int newestSlot;
   uint32_t newestSeq;
   int count;
   findNewest(newestSlot, newestSeq, count);
-  if (count > 0) return;
 
-  if (migrateV1LogIfNeeded()) return;
+  if (count == 0) {
+    if (!migrateV1LogIfNeeded()) {
+      uint16_t vIdle = 0, vSag = 0;
+      uint8_t pct = 0;
+      if (legacyStatsAvailable(vIdle, vSag, pct)) {
+        BatteryLogRecord r{};
+        r.vIdle_mV = vIdle;
+        r.vSag_mV = vSag;
+        r.health_pct = pct;
+        r.temp_centiC = 0;
+        r.profile = PROFILE_UNKNOWN;
+        r.seq = 1UL;
+        r.magic = REC_MAGIC;
+        writeRec(0, r);
+        writeTimeSlot(0, TIME_UNKNOWN);
+      }
+    }
+  }
 
-  uint16_t vIdle = 0, vSag = 0;
-  uint8_t pct = 0;
-  if (!legacyStatsAvailable(vIdle, vSag, pct)) return;
-
-  BatteryLogRecord r{};
-  r.vIdle_mV = vIdle;
-  r.vSag_mV = vSag;
-  r.health_pct = pct;
-  r.temp_centiC = 0;
-  r.profile = PROFILE_UNKNOWN;
-  r.seq = 1UL;
-  r.magic = REC_MAGIC;
-  writeRec(0, r);
-  writeTimeSlot(0, TIME_UNKNOWN);
+  fixWrappedLogTemps();
 }
 
 static bool getNewestBatteryLog(BatteryLogRecord &r) {
@@ -591,6 +607,10 @@ bool loadBatteryStatsFromEEPROM(uint16_t &vIdle, uint16_t &vSag, uint8_t &pct) {
 
 static int16_t readRtcTempCentiC() {
   float tC = rtc.getTemperature();
+  // Some RTClib builds return the DS3231 temp MSB as unsigned; fix wrapped negatives.
+  if (tC > 100.0f) {
+    tC -= 256.0f;
+  }
   if (tC >= 0.0f) {
     return (int16_t)(tC * 100.0f + 0.5f);
   }
