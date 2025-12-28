@@ -139,7 +139,7 @@ ISR(PCINT2_vect) {
 // -------------------- Power / Sleep --------------------
 
 void enterSleep() {
-  // reaches 0.22µA in sleep - requires BOD disabled by burning efuse = 0xFF
+  // reaches 0.22uA in sleep - requires BOD disabled by burning efuse = 0xFF
   ADCSRA = 0;
   MCUCR = (1 << BODS) | (1 << BODSE);
   MCUCR = (1 << BODS);
@@ -269,6 +269,34 @@ void showTime(TM1637Display &disp, int hours, int minutes) {
 void showTriggerTime(TM1637Display &disp, int hours, int minutes) {
   int trigTime = hours * 100 + minutes;
   disp.showNumberDecEx(trigTime, 0b01000000, true);
+}
+
+static void showBootPattern() {
+  const uint8_t dash = 0x40; // segment G
+  uint8_t segs[4] = { dash, dash, dash, dash };
+  displayBat.setSegments(segs);
+  displayCurrentTime.setSegments(segs);
+  displayTriggerTime.setSegments(segs);
+}
+
+static const uint8_t TM_BRIGHTNESS_MAX = 7;
+
+static uint8_t tmBrightnessFromLevel(uint8_t level) {
+  if (level > TM_BRIGHTNESS_MAX) level = TM_BRIGHTNESS_MAX;
+  return (uint8_t)(0x08 | level); // keep display on
+}
+
+static void setAllDisplayBrightnessLevel(uint8_t level) {
+  uint8_t b = tmBrightnessFromLevel(level);
+  displayBat.setBrightness(b);
+  displayCurrentTime.setBrightness(b);
+  displayTriggerTime.setBrightness(b);
+}
+
+static uint8_t fadeLevelFromElapsed(uint32_t elapsedMs, uint16_t totalMs) {
+  if (totalMs == 0 || elapsedMs >= totalMs) return TM_BRIGHTNESS_MAX;
+  uint32_t scaled = elapsedMs * (uint32_t)TM_BRIGHTNESS_MAX;
+  return (uint8_t)(scaled / totalMs);
 }
 
 // -------------------- Button helpers --------------------
@@ -927,13 +955,13 @@ static const uint16_t MARIO_DUTY_BASE_PERMILLE = 310;   // 31.0% at >=86% health
 static volatile uint16_t gMarioDutyPermille = MARIO_DUTY_BASE_PERMILLE;
 
 // Map battery percent -> duty (permille).
-// Rule: >=86% => 310‰, below that => increase duty.
+// Rule: >=86% => 310 permille, below that => increase duty.
 // Tune knobs:
 //  - PER_PERCENT_UP: how many permille to add per missing percent below 86
 //  - MAX_DUTY: absolute safety cap (timer1Start already caps at 900, but keep this sane)
 static uint16_t marioDutyFromPercent(uint8_t pct) {
   const uint8_t  THRESH_PCT      = 86;
-  const uint16_t PER_PERCENT_UP  = 4;    // 4‰ per % below 86 -> 0% => 310 + 86*4 = 654‰
+  const uint16_t PER_PERCENT_UP  = 4;    // 4 permille per % below 86 -> 0% => 310 + 86*4 = 654 permille
   const uint16_t MAX_DUTY        = 850;  // keep a little headroom under 900
 
   if (pct >= THRESH_PCT) return MARIO_DUTY_BASE_PERMILLE;
@@ -1017,6 +1045,15 @@ static const MarioNote mario7[] = {
   {784, 150, 330},  // G5
   {392, 160,   0},  // G4
 };
+
+static uint16_t marioTotalDurationMs() {
+  uint32_t total = 0;
+  for (uint8_t i = 0; i < (sizeof(mario7) / sizeof(mario7[0])); i++) {
+    total += (uint32_t)mario7[i].durMs + (uint32_t)mario7[i].gapMs;
+  }
+  if (total > 65535UL) total = 65535UL;
+  return (uint16_t)total;
+}
 
 // ---------- [3] Timer2-driven scheduler state (ALL used by ISR => volatile) ----------
 static volatile bool     marioPlaying = false;
@@ -1233,13 +1270,13 @@ static void twiReset() {
 }
 
 void preparePinsForSleep() {
-  // TM1637 modules – make sure they are high-Z to avoid backfeeding +4V
+  // TM1637 modules - make sure they are high-Z to avoid backfeeding +4V
   pinMode(TM_CLK,       INPUT); digitalWrite(TM_CLK,       LOW);
   pinMode(TM_DIO_BAT,   INPUT); digitalWrite(TM_DIO_BAT,   LOW);
   pinMode(TM_DIO_TIME,  INPUT); digitalWrite(TM_DIO_TIME,  LOW);
   pinMode(TM_DIO_TRIG,  INPUT); digitalWrite(TM_DIO_TRIG,  LOW);
 
-  // I2C pins to RTC – also high-Z, no pullups from the AVR side
+  // I2C pins to RTC - also high-Z, no pullups from the AVR side
   pinMode(A4, INPUT); digitalWrite(A4, LOW);  // SDA
   pinMode(A5, INPUT); digitalWrite(A5, LOW);  // SCL
 
@@ -1317,7 +1354,7 @@ void loop() {
       Wire.setWireTimeout(25000, true); // 25ms, reset TWI on timeout
     #endif
     initDisplays();
-    delay(250);        // I2C/RTC settle (or just “system settle”)
+    delay(50);        // I2C/RTC settle (or just "system settle")
 
     uint16_t vIdle_mV = 0, vSag_mV = 0;
     uint8_t last_healthPct = 0;
@@ -1361,7 +1398,36 @@ void loop() {
     RepeatBtn rbNowMinus, rbNowPlus, rbOpenMinus, rbOpenPlus;
     bool openChordLatched = false;   // prevents repeat while held
 
-    if(woke) { marioStartNonBlocking(); } // only mario on config button
+    uint32_t marioFadeStartMs = 0;
+    uint16_t marioFadeTotalMs = 0;
+    uint8_t marioFadeLevel = 0;
+    bool marioFadeActive = false;
+
+    if (woke) {
+      marioStartNonBlocking(); // only mario on config button
+      marioFadeStartMs = millis();
+      marioFadeTotalMs = marioTotalDurationMs();
+      marioFadeActive = true;
+      marioFadeLevel = 0;
+      setAllDisplayBrightnessLevel(0);
+      showBootPattern();
+    }
+
+    auto updateMarioFade = [&](uint32_t nowMs) {
+      if (!marioFadeActive) return;
+      if (!marioIsPlaying()) {
+        setAllDisplayBrightnessLevel(TM_BRIGHTNESS_MAX);
+        marioFadeActive = false;
+        marioFadeLevel = TM_BRIGHTNESS_MAX;
+        return;
+      }
+      uint32_t elapsed = nowMs - marioFadeStartMs;
+      uint8_t level = fadeLevelFromElapsed(elapsed, marioFadeTotalMs);
+      if (level != marioFadeLevel) {
+        setAllDisplayBrightnessLevel(level);
+        marioFadeLevel = level;
+      }
+    };
 
     // --- Phase-lock RTC time to millis() on an RTC second tick ---
     DateTime  baseNow; 
@@ -1377,6 +1443,7 @@ void loop() {
         baseNowMs = millis();  // capture MCU time right then
         break;
       }
+      updateMarioFade(millis());
     }
     int32_t  editNowDeltaMin  = 0;               // shadow adjustment
     int32_t  editOpenDeltaMin = 0;               // shadow adjustment
@@ -1398,18 +1465,24 @@ void loop() {
 
       if (!buttonHigh) {
         // Button is LOW: count how many consecutive times we see it low.
-        if (buttonLowCount < 200) buttonLowCount++;   // 200 * 1ms ≈ 200ms
+        if (buttonLowCount < 200) buttonLowCount++;   // 200 * 1ms ~ 200ms
       } else {
         buttonLowCount = 0; // any high resets the counter
       }
 
       if (buttonLowCount >= 200 && !marioIsPlaying()) {
-        // Consider this a "real" release → exit config mode
+        // Consider this a "real" release -> exit config mode
+        if (marioFadeActive) {
+          setAllDisplayBrightnessLevel(TM_BRIGHTNESS_MAX);
+          marioFadeActive = false;
+          marioFadeLevel = TM_BRIGHTNESS_MAX;
+        }
         break;
       }
 
       // --- ONLY do the expensive RTC+display stuff at 20 Hz when SW1 is held---
       uint32_t nowMs = millis();
+      updateMarioFade(nowMs);
       if (buttonHigh && (int32_t)(nowMs - nextUiUpdateMs) >= 0) {
         nextUiUpdateMs = nowMs + (marioIsPlaying() ? 150 : 50); // 50 ms => 20 Hz
         
