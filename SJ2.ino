@@ -933,7 +933,7 @@ static volatile uint16_t gMarioDutyPermille = MARIO_DUTY_BASE_PERMILLE;
 //  - MAX_DUTY: absolute safety cap (timer1Start already caps at 900, but keep this sane)
 static uint16_t marioDutyFromPercent(uint8_t pct) {
   const uint8_t  THRESH_PCT      = 86;
-  const uint16_t PER_PERCENT_UP  = 6;    // 6‰ per % below 86 -> 0% => 310 + 86*6 = 826‰
+  const uint16_t PER_PERCENT_UP  = 4;    // 4‰ per % below 86 -> 0% => 310 + 86*4 = 654‰
   const uint16_t MAX_DUTY        = 850;  // keep a little headroom under 900
 
   if (pct >= THRESH_PCT) return MARIO_DUTY_BASE_PERMILLE;
