@@ -1,5 +1,4 @@
 # SleepyJoe
 Atmega328p for doing daily pulse and sleep
 
-<img width="2701" height="1247" alt="superMarioTimer" src="https://github.com/user-attachments/assets/7f265857-cba3-4551-809c-ad8c86fa93e4" />
-
+<img width="2681" height="1239" alt="sj100k" src="https://github.com/user-attachments/assets/715612c0-17c4-4807-9b46-d94f9a7f4775" />
